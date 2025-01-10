@@ -3,8 +3,7 @@ import os
 import boto3
 from aisuite.provider import Provider, LLMError
 from aisuite.framework import ChatCompletionResponse
-
-
+import json
 class AwsProvider(Provider):
     def __init__(self, **config):
         """
@@ -36,7 +35,16 @@ class AwsProvider(Provider):
         self.region_name = config.get(
             "region_name", os.getenv("AWS_REGION", "us-west-2")
         )
-        self.client = boto3.client("bedrock-runtime", region_name=self.region_name)
+
+
+        filtered_creds = {
+            'aws_access_key_id': config['aws_access_key_id'],
+            'aws_secret_access_key': config['aws_secret_access_key']
+        }
+
+        print(self.region_name)
+
+        self.client = boto3.client("bedrock-runtime", region_name=self.region_name, **filtered_creds )
         self.inference_parameters = [
             "maxTokens",
             "temperature",
@@ -47,9 +55,13 @@ class AwsProvider(Provider):
     def normalize_response(self, response):
         """Normalize the response from the Bedrock API to match OpenAI's response format."""
         norm_response = ChatCompletionResponse()
-        norm_response.choices[0].message.content = response["output"]["message"][
-            "content"
-        ][0]["text"]
+
+        model_response = json.loads(response["body"].read())
+
+        # Extract and print the response text.
+        response_text = model_response["content"][0]["text"]
+        norm_response.choices[0].message.content = response_text
+
         return norm_response
 
     def chat_completions_create(self, model, messages, **kwargs):
@@ -58,16 +70,23 @@ class AwsProvider(Provider):
         # https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
         system_message = []
         if messages[0]["role"] == "system":
-            system_message = [{"text": messages[0]["content"]}]
+            system_message = messages[0]["content"]
             messages = messages[1:]
 
         formatted_messages = []
+
         for message in messages:
-            # QUIETLY Ignore any "system" messages except the first system message.
+            # Skip system messages except the first one
             if message["role"] != "system":
-                formatted_messages.append(
-                    {"role": message["role"], "content": [{"text": message["content"]}]}
-                )
+                # Explicitly set both type and text fields
+                content_item = {
+                    "type": "text",
+                    "text": message["content"]
+                }
+                formatted_messages.append({
+                    "role": message["role"],
+                    "content": [content_item]  # Wrap the content item in a list
+                })
 
         # Maintain a list of Inference Parameters which Bedrock supports.
         # These fields need to be passed using inferenceConfig.
@@ -82,12 +101,17 @@ class AwsProvider(Provider):
             else:
                 additional_model_request_fields[key] = value
 
+        native_request = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 4096,
+            "temperature": 0,
+            "messages": formatted_messages,
+            "system": system_message,
+        }
+
+        # Convert the native request to JSON.
+        request = json.dumps(native_request)
         # Call the Bedrock Converse API.
-        response = self.client.converse(
-            modelId=model,  # baseModelId or provisionedModelArn
-            messages=formatted_messages,
-            system=system_message,
-            inferenceConfig=inference_config,
-            additionalModelRequestFields=additional_model_request_fields,
-        )
+        response = self.client.invoke_model(modelId=model, body=request)
+
         return self.normalize_response(response)
